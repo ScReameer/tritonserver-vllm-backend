@@ -5,3 +5,10 @@ instance_group [
     kind: KIND_MODEL
   }
 ]
+
+parameters: {
+  key: "multimodal"
+  value: {
+    string_value: "true"
+  }
+}

@@ -24,6 +24,7 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import asyncio
 import base64
 import json
 from abc import abstractmethod
@@ -35,6 +36,7 @@ import triton_python_backend_utils as pb_utils
 from PIL import Image
 from vllm.inputs.data import TokensPrompt
 from vllm.lora.request import LoRARequest
+from vllm.multimodal.utils import fetch_image
 from vllm.outputs import (
     EmbeddingOutput,
     EmbeddingRequestOutput,
@@ -307,24 +309,42 @@ class GenerateRequest(RequestBase):
 
 class EmbedRequest(RequestBase):
     def __init__(
-        self, request, executor_callback: Callable, output_dtype: np.dtype, logger
+        self, request, executor_callback: Callable, output_dtype: np.dtype, logger, tokenizer=None
     ):
         super().__init__(request, executor_callback, output_dtype, logger)
+        self.tokenizer = tokenizer
 
     def _get_input_tensors(self):
         embedding_request = pb_utils.get_input_tensor_by_name(
             self.triton_request, "embedding_request"
         ).as_numpy()[0]
         embedding_request = json.loads(embedding_request.decode("utf-8"))
-        # prompt
-        prompt = embedding_request["input"]
-        if isinstance(prompt, str):
-            pass  # do nothing
-        elif (
-            isinstance(prompt, list) and len(prompt) > 0 and isinstance(prompt[0], int)
-        ):
-            # Single list of token IDs
-            prompt = TokensPrompt(prompt_token_ids=prompt)
+        
+        # Get modality (default to "text")
+        modality = embedding_request.get("modality", "text")
+        
+        # prompt/input
+        input_data = embedding_request["input"]
+        
+        if modality == "image":
+            # For image modality, return raw conversations for async processing in execute()
+            conversations = input_data if isinstance(input_data, list) else [input_data]
+            prompt = {"modality": "image", "conversations": conversations}
+        else:
+            # Process as text (default behavior)
+            prompt = input_data
+            if isinstance(prompt, str):
+                pass  # Single string - use as is
+            elif isinstance(prompt, list):
+                if len(prompt) > 0 and isinstance(prompt[0], int):
+                    # Single list of token IDs
+                    prompt = TokensPrompt(prompt_token_ids=prompt)
+                elif len(prompt) > 0 and isinstance(prompt[0], str):
+                    # Batch of strings - mark for parallel processing
+                    prompt = {"modality": "text_batch", "texts": prompt}
+                else:
+                    # Empty list or unknown type - use as is
+                    pass
 
         # pooling_params
         pooling_params = self._to_pooling_params(embedding_request)
@@ -351,6 +371,95 @@ class EmbedRequest(RequestBase):
             self.additional_outputs,
         ) = self._get_input_tensors()
 
+        # Helper function for processing single item in batch
+        async def process_single_item(item):
+            outputs = []
+            unique_id = random_uuid()
+            async for response in self.executor_callback(item, pooling_params, unique_id):
+                outputs.append(response)
+            return outputs
+
+        # Handle image modality - process conversations asynchronously
+        if isinstance(prompt, dict) and prompt.get("modality") == "image":
+            conversations = prompt["conversations"]
+            
+            if not self.tokenizer:
+                raise ValueError("Tokenizer is required for multimodal embeddings")
+            
+            # First pass: extract all data (prompt texts and image URLs)
+            conversation_data = []
+            for conversation in conversations:
+                # Apply chat_template to get formatted prompt string with image placeholders
+                prompt_text = self.tokenizer.apply_chat_template(
+                    conversation,
+                    tokenize=False,
+                    add_generation_prompt=False
+                )
+                
+                # Extract image URL from conversation
+                image_url = None
+                for message in conversation:
+                    if message.get("role") == "user":
+                        content = message.get("content", [])
+                        if isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict) and item.get("type") == "image_url":
+                                    image_url = item.get("image_url", {}).get("url")
+                                    break
+                
+                if not image_url:
+                    raise ValueError("No image_url found in user message")
+                
+                conversation_data.append({
+                    "prompt_text": prompt_text,
+                    "image_url": image_url
+                })
+            
+            # Fetch all images in parallel using asyncio.to_thread
+            async def fetch_one_image(url):
+                return await asyncio.to_thread(fetch_image, url)
+            
+            try:
+                images = await asyncio.gather(*[fetch_one_image(data["image_url"]) for data in conversation_data])
+            except Exception as e:
+                raise ValueError(f"Failed to fetch images: {str(e)}")
+            
+            # Combine prompts with fetched images
+            prompts = []
+            for data, image_media in zip(conversation_data, images):
+                prompts.append({
+                    "prompt": data["prompt_text"],
+                    "multi_modal_data": {"image": image_media},
+                })
+            
+            # For batch processing, we need to call encode for each item separately
+            # vLLM will batch them internally
+            if len(prompts) > 1:
+                # Process all prompts in parallel with asyncio.gather
+                all_results = await asyncio.gather(*[process_single_item(p) for p in prompts])
+                
+                # Yield results in order
+                for result_list in all_results:
+                    for response in result_list:
+                        yield response
+                return
+            else:
+                # Single item, use original flow
+                prompt = prompts[0]
+        
+        # Handle text batch - process each text separately
+        elif isinstance(prompt, dict) and prompt.get("modality") == "text_batch":
+            texts = prompt["texts"]
+            
+            # Process all texts in parallel with asyncio.gather
+            all_results = await asyncio.gather(*[process_single_item(t) for t in texts])
+            
+            # Yield results in order
+            for result_list in all_results:
+                for response in result_list:
+                    yield response
+            return
+
         # Create PoolingParams for embeddings
         response_iterator = self.executor_callback(prompt, pooling_params, self.id)
 
@@ -360,13 +469,14 @@ class EmbedRequest(RequestBase):
 
     def _to_pooling_params(self, embedding_request: dict):
         pooling_params_dict = embedding_request.get("pooling_params", {})
-
-        pooling_params = PoolingParams(task="embed")
-        dims = None
-        if "dimensions" in pooling_params_dict:
-            dims = pooling_params_dict["dimensions"][0]
-            pooling_params = PoolingParams(dimensions=dims, task="embed")
-        return pooling_params
+        
+        # Extract dimensions if present
+        dims = pooling_params_dict.get("dimensions", [None])[0] if "dimensions" in pooling_params_dict else None
+        
+        # Create PoolingParams once with all parameters
+        if dims is not None:
+            return PoolingParams(dimensions=dims, task="embed")
+        return PoolingParams(task="embed")
 
     def create_response(self, request_output: PoolingRequestOutput[EmbeddingOutput]):
         output_tensors = []

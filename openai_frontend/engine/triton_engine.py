@@ -27,8 +27,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass
@@ -96,6 +98,8 @@ from schemas.openai import (
 from utils.utils import ClientError, ServerError
 
 
+logger = logging.getLogger(__name__)
+
 # TODO: Improve type hints
 @dataclass
 class TritonModelMetadata:
@@ -116,6 +120,8 @@ class TritonModelMetadata:
     # Conversion format between OpenAI and Triton requests
     inference_request_converter: Callable
     embedding_request_converter: Callable
+    # Whether the model supports multimodal inputs
+    is_multimodal: bool = False
 
 
 class TritonLLMEngine(LLMEngine):
@@ -411,30 +417,55 @@ class TritonLLMEngine(LLMEngine):
                 request,
             )
         )
-
-        # Response validation with decoupled models in mind
-        responses = [response async for response in responses]
-        _validate_triton_responses_non_streaming(responses)
-        response = responses[0]
-
-        # Extract embedding from response (currently stored as JSON string in text_output)
-        embedding_json = _get_output(response)
-        embedding_list = json.loads(embedding_json)
-
-        usage = _get_usage_from_response(
-            response, metadata.backend, RequestKind.EMBEDDING
-        )
-
-        embedding = self._get_embedding(embedding_list, request.encoding_format)
-        embedding_obj = EmbeddingObject(
-            embedding=embedding, index=0, object="embedding"
-        )
+        
+        # Process responses in parallel to avoid sequential bottleneck
+        async def process_response(response, idx):
+            # Extract embedding from response
+            embedding_json = _get_output(response)
+            embedding_list = json.loads(embedding_json)
+            
+            usage = _get_usage_from_response(
+                response, metadata.backend, RequestKind.EMBEDDING
+            )
+            
+            embedding = self._get_embedding(embedding_list, request.encoding_format)
+            embedding_obj = EmbeddingObject(
+                embedding=embedding, index=idx, object="embedding"
+            )
+            return embedding_obj, usage
+        
+        # Create tasks for all responses (non-blocking collection)
+        tasks = []
+        response_count = 0
+        async for response in responses:
+            task = asyncio.create_task(process_response(response, response_count))
+            tasks.append(task)
+            response_count += 1
+        
+        # Wait for all processing tasks to complete in parallel
+        results = await asyncio.gather(*tasks)
+        
+        # Collect results
+        embedding_objects = []
+        total_usage = None
+        for embedding_obj, usage in results:
+            embedding_objects.append(embedding_obj)
+            if usage:
+                if total_usage is None:
+                    total_usage = usage
+                else:
+                    total_usage.prompt_tokens += usage.prompt_tokens
+                    total_usage.total_tokens += usage.total_tokens
+        
+        # Validate
+        if len(embedding_objects) < 1:
+            raise ServerError(f"Unexpected number of responses: {len(embedding_objects)}, expected at least 1.")
 
         return CreateEmbeddingResponse(
             object="list",
-            data=[embedding_obj],
+            data=embedding_objects,
             model=request.model,
-            usage=usage,
+            usage=total_usage,
         )
 
     @staticmethod
@@ -514,13 +545,26 @@ class TritonLLMEngine(LLMEngine):
             )
 
             echo_tensor_name = None
+            is_multimodal = False
+            
+            # Check for multimodal support in model config parameters
+            config_params = model.config().get("parameters", {})
+            if "multimodal" in config_params:
+                param_value = config_params["multimodal"].get("string_value", "").lower()
+                is_multimodal = param_value in ["true", "1", "yes"]
+            
+            # Check for echo tensor and image input support
+            # For Python backend (vLLM), only use explicit multimodal parameter
+            # because vLLM auto-creates 'image' input even for text-only models
             for input in model.config()["input"]:
                 if input["name"] in [
                     "exclude_input_in_output",
                     "sampling_param_exclude_input_from_output",
                 ]:
                     echo_tensor_name = input["name"]
-                    break
+                # Only check image input for non-vLLM backends
+                if backend != "vllm" and not is_multimodal and input["name"] == "image":
+                    is_multimodal = True
 
             metadata = TritonModelMetadata(
                 name=name,
@@ -536,6 +580,7 @@ class TritonLLMEngine(LLMEngine):
                 embedding_request_converter=self._determine_request_converter(
                     backend, RequestKind.EMBEDDING
                 ),
+                is_multimodal=is_multimodal,
             )
             model_metadata[name] = metadata
 
@@ -1047,6 +1092,23 @@ class TritonLLMEngine(LLMEngine):
             raise ServerError(
                 f"Unknown embedding request format for model: {request.model}"
             )
+
+        # Validate modality support
+        if request.modality == "image" and not metadata.is_multimodal:
+            error_msg = (
+                f"Model '{request.model}' is configured as text-only and does not support image embeddings. "
+                f"To use image modality, you must:\n"
+                f"1. Use a multimodal embedding model (e.g., Qwen3-VL-Embedding)\n"
+                f"2. Explicitly enable multimodal support in the model's config.pbtxt:\n\n"
+                f"parameters: {{\n"
+                f"  key: \"multimodal\"\n"
+                f"  value: {{\n"
+                f"    string_value: \"true\"\n"
+                f"  }}\n"
+                f"}}\n\n"
+                f"Alternatively, use modality='text' for text-only embeddings."
+            )
+            raise ClientError(error_msg)
 
     def _should_stream_with_auto_tool_parsing(
         self, request: CreateChatCompletionRequest

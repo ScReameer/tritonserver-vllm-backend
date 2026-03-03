@@ -398,7 +398,7 @@ class TritonPythonModel:
                 # Stop checking for cancellation if the last response is generated.
                 if not response_state["last_response_generated"]:
                     response_state["is_cancelled"] = response_sender.is_cancelled()
-            except Exception as e:
+            except Exception:
                 self.logger.log_error(
                     f"An error occurred while sending a response: {traceback.format_exc()}"
                 )
@@ -477,8 +477,10 @@ class TritonPythonModel:
                         self.logger,
                     )
             elif request_task_name == "embed":
+                # Get tokenizer from vLLM engine for applying chat templates
+                tokenizer = getattr(self._llm_engine, 'tokenizer', None)
                 request = EmbedRequest(
-                    request, self._llm_engine.encode, self.output_dtype, self.logger
+                    request, self._llm_engine.encode, self.output_dtype, self.logger, tokenizer
                 )
             else:
                 raise ValueError(
@@ -488,19 +490,17 @@ class TritonPythonModel:
             response_iterator = request.execute()
 
             request_output_state = {}
-            async for request_output in response_iterator:
-                # Cancellation state will be checked by the response loop and written to
-                # the response state if streaming. If not streaming, cancellation state
-                # needs to be checked here.
-                is_cancelled = response_state["is_cancelled"]
-                if not request.stream:
-                    is_cancelled = response_sender.is_cancelled()
-                if is_cancelled:
-                    self.logger.log_info("[vllm] Cancelling the request")
-                    await self._llm_engine.abort(request.id)
-                    self.logger.log_info("[vllm] Successfully cancelled the request")
+            
+            if request.stream:
+                # Streaming: send responses immediately as they arrive
+                async for request_output in response_iterator:
+                    # Cancellation check
+                    is_cancelled = response_state["is_cancelled"]
+                    if is_cancelled:
+                        self.logger.log_info("[vllm] Cancelling the request")
+                        await self._llm_engine.abort(request.id)
+                        self.logger.log_info("[vllm] Successfully cancelled the request")
 
-                    if request.stream:
                         # Add cancelled final response to response loop.
                         response_state["last_response_generated"] = True
                         response = pb_utils.InferenceResponse(
@@ -514,11 +514,8 @@ class TritonPythonModel:
                         self._response_queue.put_nowait(
                             (response_state, response, flags)
                         )
+                        break
 
-                    break
-
-                # Send each response if streaming.
-                if request.stream:
                     response = request.create_response(
                         request_output,
                         request_output_state,
@@ -530,22 +527,40 @@ class TritonPythonModel:
                         flags = pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL
                         decrement_ongoing_request_count = False
                     self._response_queue.put_nowait((response_state, response, flags))
+            else:
+                # Non-streaming: collect all responses then send them in batch
+                responses_to_send = []
+                async for request_output in response_iterator:
+                    # Cancellation check
+                    is_cancelled = response_sender.is_cancelled()
+                    if is_cancelled:
+                        self.logger.log_info("[vllm] Cancelling the request")
+                        await self._llm_engine.abort(request.id)
+                        self.logger.log_info("[vllm] Successfully cancelled the request")
+                        break
 
-            # Send the last response which contains all the outputs if not streaming.
-            if not request.stream:
-                if request_task_name == "generate":
-                    response = request.create_response(
-                        request_output=request_output,
-                        request_output_state={},
-                        prepend_input=request.prepend_input,
-                    )
-                else:
-                    response = request.create_response(
-                        request_output=request_output,
-                    )
-                response_sender.send(
-                    response, flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL
-                )
+                    # Create and buffer response
+                    if request_task_name == "generate":
+                        response = request.create_response(
+                            request_output=request_output,
+                            request_output_state={},
+                            prepend_input=request.prepend_input,
+                        )
+                    else:
+                        response = request.create_response(
+                            request_output=request_output,
+                        )
+                    responses_to_send.append(response)
+                
+                # Send all responses with proper flags
+                for idx, response in enumerate(responses_to_send):
+                    flags = pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL if idx == len(responses_to_send) - 1 else 0
+                    response_sender.send(response, flags=flags)
+                
+                # Manually decrement counter since we're not using response_queue
+                if len(responses_to_send) > 0:
+                    self._ongoing_request_count -= 1
+                    decrement_ongoing_request_count = False
 
         except Exception as e:
             self.logger.log_error(
@@ -606,7 +621,7 @@ class TritonPythonModel:
         future = asyncio.run_coroutine_threadsafe(coro, self._event_loop)
         try:
             future.result()
-        except Exception as e:
+        except Exception:
             self.logger.log_error(
                 f"[vllm] Engine is not healthy and model will be unloaded: {traceback.format_exc()}"
             )

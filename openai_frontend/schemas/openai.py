@@ -969,7 +969,7 @@ class CreateEmbeddingRequest(BaseModel):
     # Explicitly return errors for unknown fields.
     model_config: ConfigDict = ConfigDict(extra="forbid")
 
-    input: Union[str, List[int]] = Field(
+    input: Union[str, List[int], List[str]] = Field(
         ...,
         description="Input text to embed, encoded as a string or array of tokens. To embed multiple inputs in a single request, pass an array of strings or array of token arrays.",
         min_length=1,
@@ -979,6 +979,10 @@ class CreateEmbeddingRequest(BaseModel):
         ...,
         description="ID of the model to use. See the [model endpoint compatibility](/docs/models/model-endpoint-compatibility) table for details on which models work with the Chat API.",
         examples=["text-embedding-ada-002"],
+    )
+    modality: Optional[Literal["text", "image"]] = Field(
+        "text",
+        description="The modality of the input. 'text' for text-only embeddings (default), 'image' for image embeddings. When 'image', all inputs are treated as image URLs.",
     )
     dimensions: Optional[int] = Field(
         None,
