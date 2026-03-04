@@ -36,7 +36,6 @@ import triton_python_backend_utils as pb_utils
 from PIL import Image
 from vllm.inputs.data import TokensPrompt
 from vllm.lora.request import LoRARequest
-from vllm.multimodal.utils import fetch_image
 from vllm.outputs import (
     EmbeddingOutput,
     EmbeddingRequestOutput,
@@ -47,6 +46,19 @@ from vllm.pooling_params import PoolingParams
 from vllm.utils import random_uuid
 
 from utils.vllm_backend_utils import TritonSamplingParams
+
+try:
+    # Newer vLLM versions
+    from vllm.multimodal.media import MediaConnector
+except ImportError:
+    # Older vLLM versions
+    from vllm.multimodal.utils import MediaConnector
+
+_media_connector = MediaConnector()
+
+
+async def fetch_image_async(image_url: str):
+    return await _media_connector.fetch_image_async(image_url)
 
 
 class RequestBase:
@@ -415,14 +427,22 @@ class EmbedRequest(RequestBase):
                     "image_url": image_url
                 })
             
-            # Fetch all images in parallel using asyncio.to_thread
-            async def fetch_one_image(url):
-                return await asyncio.to_thread(fetch_image, url)
-            
-            try:
-                images = await asyncio.gather(*[fetch_one_image(data["image_url"]) for data in conversation_data])
-            except Exception as e:
-                raise ValueError(f"Failed to fetch images: {str(e)}")
+            # Fetch all images asynchronously.
+
+            async def fetch_one_image(index: int, url: str):
+                try:
+                    return await fetch_image_async(url)
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to fetch image at index {index} ({url}): {e}"
+                    ) from e
+
+            images = await asyncio.gather(
+                *[
+                    fetch_one_image(i, data["image_url"])
+                    for i, data in enumerate(conversation_data)
+                ]
+            )
             
             # Combine prompts with fetched images
             prompts = []
