@@ -24,7 +24,7 @@ curl -s http://localhost:9000/v1/embeddings \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "'${MODEL}'",
-    "input": ["https://model-demo.oss-cn-hangzhou.aliyuncs.com/Qwen3-VL-Embedding.png"],
+    "input": ["https://raw.githubusercontent.com/pytorch/hub/master/images/dog.jpg"],
     "dimensions": 10,
     "encoding_format": "float",
     "modality": "image"
