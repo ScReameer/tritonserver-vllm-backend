@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/tritonserver:26.01-vllm-python-py3
+FROM nvcr.io/nvidia/tritonserver:26.02-vllm-python-py3
 
 ARG BASE_PATH="/runpod-volume"
 
@@ -12,5 +12,8 @@ COPY model_repository /models
 
 COPY openai_frontend /opt/tritonserver/python/openai/openai_frontend
 COPY vllm_backend /opt/tritonserver/backends/vllm
+
+# For Runpod
+EXPOSE 80
 
 CMD ["bash", "-lc", "python3 /opt/tritonserver/python/openai/openai_frontend/main.py --model-repository /models --openai-port ${PORT}"]
