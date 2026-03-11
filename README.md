@@ -6,7 +6,7 @@ docker compose up --build
 
 Text emdbeddings:
 ```bash
-MODEL="Qwen3-VL-Embedding-2B"
+MODEL="Qwen3-VL-Embedding-8B"
 curl -s http://localhost:9000/v1/embeddings \
   -H 'Content-Type: application/json' \
   -d '{
@@ -19,7 +19,7 @@ curl -s http://localhost:9000/v1/embeddings \
 
 Image emdbeddings:
 ```bash
-MODEL="Qwen3-VL-Embedding-2B"
+MODEL="Qwen3-VL-Embedding-8B"
 curl -s http://localhost:9000/v1/embeddings \
   -H 'Content-Type: application/json' \
   -d '{
@@ -53,7 +53,7 @@ Output:
       "index": 1
     }
   ],
-  "model": "Qwen3-VL-Embedding-2B",
+  "model": "Qwen3-VL-Embedding-8B",
   "usage": {
     "prompt_tokens": 1259,
     "total_tokens": 1259
@@ -63,7 +63,7 @@ Output:
 
 Test after deploy:
 ```bash
-MODEL="Qwen3-VL-Embedding-2B"
+MODEL="Qwen3-VL-Embedding-8B"
 RUNPOD_API_KEY="YOUR_RUNPOD_API_KEY"
 curl -s https://<ENDPOINT_ID>.api.runpod.ai/v1/embeddings \
   -H 'Content-Type: application/json' \
