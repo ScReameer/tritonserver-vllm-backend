@@ -321,7 +321,12 @@ class GenerateRequest(RequestBase):
 
 class EmbedRequest(RequestBase):
     def __init__(
-        self, request, executor_callback: Callable, output_dtype: np.dtype, logger, tokenizer=None
+        self,
+        request,
+        executor_callback: Callable,
+        output_dtype: np.dtype,
+        logger,
+        tokenizer=None,
     ):
         super().__init__(request, executor_callback, output_dtype, logger)
         self.tokenizer = tokenizer
@@ -331,13 +336,13 @@ class EmbedRequest(RequestBase):
             self.triton_request, "embedding_request"
         ).as_numpy()[0]
         embedding_request = json.loads(embedding_request.decode("utf-8"))
-        
+
         # Get modality (default to "text")
         modality = embedding_request.get("modality", "text")
-        
+
         # prompt/input
         input_data = embedding_request["input"]
-        
+
         if modality == "image":
             # For image modality, return raw conversations for async processing in execute()
             conversations = input_data if isinstance(input_data, list) else [input_data]
@@ -387,27 +392,39 @@ class EmbedRequest(RequestBase):
         async def process_single_item(item):
             outputs = []
             unique_id = random_uuid()
-            async for response in self.executor_callback(item, pooling_params, unique_id):
+            async for response in self.executor_callback(
+                item, pooling_params, unique_id
+            ):
                 outputs.append(response)
             return outputs
 
         # Handle image modality - process conversations asynchronously
         if isinstance(prompt, dict) and prompt.get("modality") == "image":
             conversations = prompt["conversations"]
-            
+
             if not self.tokenizer:
                 raise ValueError("Tokenizer is required for multimodal embeddings")
-            
-            # First pass: extract all data (prompt texts and image URLs)
+
+            # First pass: extract all data (prompt texts and image URLs).
+            # We keep item-level errors instead of failing the whole batch.
             conversation_data = []
-            for conversation in conversations:
-                # Apply chat_template to get formatted prompt string with image placeholders
-                prompt_text = self.tokenizer.apply_chat_template(
-                    conversation,
-                    tokenize=False,
-                    add_generation_prompt=False
-                )
-                
+            item_results = {}
+            for idx, conversation in enumerate(conversations):
+                try:
+                    # Apply chat_template to get formatted prompt string with image placeholders
+                    prompt_text = self.tokenizer.apply_chat_template(
+                        conversation,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                    )
+                except Exception as e:
+                    item_results[idx] = {
+                        "object": "error",
+                        "index": idx,
+                        "message": f"Failed to apply chat template: {e}",
+                    }
+                    continue
+
                 # Extract image URL from conversation
                 image_url = None
                 for message in conversation:
@@ -415,67 +432,141 @@ class EmbedRequest(RequestBase):
                         content = message.get("content", [])
                         if isinstance(content, list):
                             for item in content:
-                                if isinstance(item, dict) and item.get("type") == "image_url":
+                                if (
+                                    isinstance(item, dict)
+                                    and item.get("type") == "image_url"
+                                ):
                                     image_url = item.get("image_url", {}).get("url")
                                     break
-                
+
                 if not image_url:
-                    raise ValueError("No image_url found in user message")
-                
-                conversation_data.append({
-                    "prompt_text": prompt_text,
-                    "image_url": image_url
-                })
-            
+                    item_results[idx] = {
+                        "object": "error",
+                        "index": idx,
+                        "message": "No image_url found in user message",
+                    }
+                    continue
+
+                conversation_data.append(
+                    {
+                        "index": idx,
+                        "prompt_text": prompt_text,
+                        "image_url": image_url,
+                    }
+                )
+
             # Fetch all images asynchronously.
 
             async def fetch_one_image(index: int, url: str):
                 try:
                     return await fetch_image_async(url)
                 except Exception as e:
-                    raise ValueError(
+                    return ValueError(
                         f"Failed to fetch image at index {index} ({url}): {e}"
-                    ) from e
+                    )
 
-            images = await asyncio.gather(
+            fetched_images = await asyncio.gather(
                 *[
-                    fetch_one_image(i, data["image_url"])
-                    for i, data in enumerate(conversation_data)
+                    fetch_one_image(data["index"], data["image_url"])
+                    for data in conversation_data
                 ]
             )
-            
-            # Combine prompts with fetched images
+
             prompts = []
-            for data, image_media in zip(conversation_data, images):
-                prompts.append({
-                    "prompt": data["prompt_text"],
-                    "multi_modal_data": {"image": image_media},
-                })
-            
-            # For batch processing, we need to call encode for each item separately
-            # vLLM will batch them internally
-            if len(prompts) > 1:
-                # Process all prompts in parallel with asyncio.gather
-                all_results = await asyncio.gather(*[process_single_item(p) for p in prompts])
-                
-                # Yield results in order
-                for result_list in all_results:
-                    for response in result_list:
-                        yield response
-                return
-            else:
-                # Single item, use original flow
-                prompt = prompts[0]
-        
+            for data, image_media in zip(conversation_data, fetched_images):
+                idx = data["index"]
+                if isinstance(image_media, Exception):
+                    item_results[idx] = {
+                        "object": "error",
+                        "index": idx,
+                        "message": str(image_media),
+                    }
+                    continue
+
+                prompts.append(
+                    (
+                        idx,
+                        {
+                            "prompt": data["prompt_text"],
+                            "multi_modal_data": {"image": image_media},
+                        },
+                    )
+                )
+
+            async def process_indexed_item(index: int, item):
+                try:
+                    outputs = []
+                    unique_id = random_uuid()
+                    async for response in self.executor_callback(
+                        item, pooling_params, unique_id
+                    ):
+                        outputs.append(response)
+
+                    if len(outputs) == 0:
+                        return {
+                            "object": "error",
+                            "index": index,
+                            "message": "No embedding output produced",
+                        }
+
+                    return {
+                        "object": "embedding",
+                        "index": index,
+                        "outputs": outputs,
+                    }
+                except Exception as e:
+                    return {
+                        "object": "error",
+                        "index": index,
+                        "message": f"Failed to encode image at index {index}: {e}",
+                    }
+
+            if len(prompts) > 0:
+                encoded_results = await asyncio.gather(
+                    *[process_indexed_item(idx, item) for idx, item in prompts]
+                )
+                for result in encoded_results:
+                    idx = result["index"]
+                    item_results[idx] = result
+
+            # Yield items in original order. Each item is either:
+            # - {"object":"error","index":...,"message":...}
+            # - {"object":"embedding","index":...,"request_output":...}
+            for idx in range(len(conversations)):
+                result = item_results.get(idx)
+                if result is None:
+                    yield {
+                        "object": "error",
+                        "index": idx,
+                        "message": "Unknown error while processing image item",
+                    }
+                    continue
+
+                if result.get("object") == "error":
+                    yield result
+                    continue
+
+                for response in result.get("outputs", []):
+                    yield {
+                        "object": "embedding",
+                        "index": idx,
+                        "request_output": response,
+                    }
+            return
+
         # Handle text batch - process each text separately
         elif isinstance(prompt, dict) and prompt.get("modality") == "text_batch":
             texts = prompt["texts"]
-            
+
             # Process all texts in parallel with asyncio.gather
             all_results = await asyncio.gather(*[process_single_item(t) for t in texts])
-            
+
             # Yield results in order
-            for result_list in all_results:
+            for idx, result_list in enumerate(all_results):
+                if len(result_list) == 0:
+                    raise ValueError(
+                        f"No embedding output produced for text item at index {idx}"
+                    )
                 for response in result_list:
                     yield response
             return
@@ -484,15 +575,23 @@ class EmbedRequest(RequestBase):
         response_iterator = self.executor_callback(prompt, pooling_params, self.id)
 
         # Yield each response from the async iterator
+        has_response = False
         async for response in response_iterator:
+            has_response = True
             yield response
+        if not has_response:
+            raise ValueError("No embedding output produced for input prompt")
 
     def _to_pooling_params(self, embedding_request: dict):
         pooling_params_dict = embedding_request.get("pooling_params", {})
-        
+
         # Extract dimensions if present
-        dims = pooling_params_dict.get("dimensions", [None])[0] if "dimensions" in pooling_params_dict else None
-        
+        dims = (
+            pooling_params_dict.get("dimensions", [None])[0]
+            if "dimensions" in pooling_params_dict
+            else None
+        )
+
         # Create PoolingParams once with all parameters
         if dims is not None:
             return PoolingParams(dimensions=dims, task="embed")
@@ -500,6 +599,65 @@ class EmbedRequest(RequestBase):
 
     def create_response(self, request_output: PoolingRequestOutput[EmbeddingOutput]):
         output_tensors = []
+
+        # Mixed-mode payload used by image modality to support item-level errors.
+        if isinstance(request_output, dict):
+            item_type = request_output.get("object")
+            item_index = int(request_output.get("index", 0))
+
+            if item_type == "error":
+                payload = {
+                    "object": "error",
+                    "message": request_output.get("message", "Unknown error"),
+                    "index": item_index,
+                }
+                output_tensors.append(
+                    pb_utils.Tensor(
+                        "text_output",
+                        np.asarray([json.dumps(payload)], dtype=self.output_dtype),
+                    )
+                )
+                return pb_utils.InferenceResponse(output_tensors=output_tensors)
+
+            if item_type == "embedding":
+                base_output = request_output.get("request_output")
+                if base_output is None:
+                    raise ValueError(
+                        f"Missing request_output for embedding item at index {item_index}"
+                    )
+                request_output = EmbeddingRequestOutput.from_base(base_output)
+                payload = {
+                    "object": "embedding",
+                    "embedding": request_output.outputs.embedding,
+                    "index": item_index,
+                }
+                output_tensors.append(
+                    pb_utils.Tensor(
+                        "text_output",
+                        np.asarray([json.dumps(payload)], dtype=self.output_dtype),
+                    )
+                )
+
+                if self.additional_outputs["return_num_input_tokens"]:
+                    num_input_tokens = len(request_output.prompt_token_ids)
+                    output_tensors.append(
+                        pb_utils.Tensor(
+                            "num_input_tokens",
+                            np.asarray(num_input_tokens, dtype=np.uint32),
+                        )
+                    )
+
+                if self.additional_outputs["return_num_output_tokens"]:
+                    output_tensors.append(
+                        pb_utils.Tensor(
+                            "num_output_tokens", np.asarray(0, dtype=np.uint32)
+                        )
+                    )
+
+                return pb_utils.InferenceResponse(output_tensors=output_tensors)
+
+            raise ValueError(f"Unknown embedding item type: {item_type}")
+
         request_output = EmbeddingRequestOutput.from_base(request_output)
 
         # Extract embedding list from output

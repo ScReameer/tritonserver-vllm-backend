@@ -128,7 +128,7 @@ class Llama3JsonToolParser(ToolCallParser):
             )
             return ret
 
-        except Exception as e:
+        except Exception:
             # return information to just treat the tool call as regular JSON
             return ChatCompletionResponseMessage(
                 tool_calls=None, content=original_full_text, role=role
@@ -167,9 +167,9 @@ class Llama3JsonToolParser(ToolCallParser):
                     # depending on the prompt Llama can use
                     # either arguments or parameters
                     if "parameters" in obj:
-                        assert (
-                            "arguments" not in obj
-                        ), "model generated both parameters and arguments"
+                        assert "arguments" not in obj, (
+                            "model generated both parameters and arguments"
+                        )
                         obj["arguments"] = obj["parameters"]
                     tool_call_arr.append(obj)
             except partial_json_parser.core.exceptions.MalformedJSON:
@@ -211,9 +211,9 @@ class Llama3JsonToolParser(ToolCallParser):
                                 )
                             ]
                         )
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            argument_diff
+                        )
                     else:
                         delta = None
                 else:
@@ -278,9 +278,9 @@ class Llama3JsonToolParser(ToolCallParser):
                                 )
                             ]
                         )
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            argument_diff
+                        )
 
             self.prev_tool_call_arr = tool_call_arr
             return delta
