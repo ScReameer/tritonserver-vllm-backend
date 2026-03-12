@@ -26,7 +26,7 @@
 
 import queue
 import threading
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Union
 
 import triton_python_backend_utils as pb_utils
 from vllm.config import VllmConfig

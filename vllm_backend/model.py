@@ -43,9 +43,22 @@ from utils.vllm_backend_utils import build_async_engine_client_from_engine_args
 
 _VLLM_ENGINE_ARGS_FILENAME = "model.json"
 _MULTI_LORA_ARGS_FILENAME = "multi_lora.json"
+_EMBEDDING_TIMEOUT_ENV = "VLLM_EMBEDDING_TIMEOUT_SECONDS"
+_DEFAULT_EMBEDDING_TIMEOUT_SECONDS = 90.0
 
 
 class TritonPythonModel:
+    def _read_timeout_seconds(self, env_name: str, default_seconds: float) -> float:
+        raw_value = os.getenv(env_name, str(default_seconds))
+        try:
+            return float(raw_value)
+        except ValueError:
+            self.logger.log_warn(
+                "[vllm] Invalid %s='%s', using %.1fs"
+                % (env_name, raw_value, default_seconds)
+            )
+            return default_seconds
+
     @classmethod
     def auto_complete_config(cls, auto_complete_model_config):
         # Add inputs/outputs to the model config.
@@ -204,16 +217,16 @@ class TritonPythonModel:
         self.using_decoupled = pb_utils.using_decoupled_model_transaction_policy(
             self.model_config
         )
-        assert (
-            self.using_decoupled
-        ), "vLLM Triton backend must be configured to use decoupled model transaction policy"
+        assert self.using_decoupled, (
+            "vLLM Triton backend must be configured to use decoupled model transaction policy"
+        )
 
         engine_args_filepath = os.path.join(
             pb_utils.get_model_dir(), _VLLM_ENGINE_ARGS_FILENAME
         )
-        assert os.path.isfile(
-            engine_args_filepath
-        ), f"'{_VLLM_ENGINE_ARGS_FILENAME}' containing vllm engine args must be provided in '{pb_utils.get_model_dir()}'"
+        assert os.path.isfile(engine_args_filepath), (
+            f"'{_VLLM_ENGINE_ARGS_FILENAME}' containing vllm engine args must be provided in '{pb_utils.get_model_dir()}'"
+        )
         with open(engine_args_filepath) as file:
             self.vllm_engine_config = json.load(file)
 
@@ -441,9 +454,9 @@ class TritonPythonModel:
         for request in requests:
             request = self._verify_loras(request)
             if request is not None:
-                assert (
-                    self._llm_engine_shutdown_event.is_set() is False
-                ), "Cannot create tasks after shutdown has been requested"
+                assert self._llm_engine_shutdown_event.is_set() is False, (
+                    "Cannot create tasks after shutdown has been requested"
+                )
                 coro = self._infer(request)
                 asyncio.run_coroutine_threadsafe(coro, self._event_loop)
         return None
@@ -478,9 +491,13 @@ class TritonPythonModel:
                     )
             elif request_task_name == "embed":
                 # Get tokenizer from vLLM engine for applying chat templates
-                tokenizer = getattr(self._llm_engine, 'tokenizer', None)
+                tokenizer = getattr(self._llm_engine, "tokenizer", None)
                 request = EmbedRequest(
-                    request, self._llm_engine.encode, self.output_dtype, self.logger, tokenizer
+                    request,
+                    self._llm_engine.encode,
+                    self.output_dtype,
+                    self.logger,
+                    tokenizer,
                 )
             else:
                 raise ValueError(
@@ -490,7 +507,7 @@ class TritonPythonModel:
             response_iterator = request.execute()
 
             request_output_state = {}
-            
+
             if request.stream:
                 # Streaming: send responses immediately as they arrive
                 async for request_output in response_iterator:
@@ -499,7 +516,9 @@ class TritonPythonModel:
                     if is_cancelled:
                         self.logger.log_info("[vllm] Cancelling the request")
                         await self._llm_engine.abort(request.id)
-                        self.logger.log_info("[vllm] Successfully cancelled the request")
+                        self.logger.log_info(
+                            "[vllm] Successfully cancelled the request"
+                        )
 
                         # Add cancelled final response to response loop.
                         response_state["last_response_generated"] = True
@@ -530,33 +549,73 @@ class TritonPythonModel:
             else:
                 # Non-streaming: collect all responses then send them in batch
                 responses_to_send = []
-                async for request_output in response_iterator:
-                    # Cancellation check
-                    is_cancelled = response_sender.is_cancelled()
-                    if is_cancelled:
-                        self.logger.log_info("[vllm] Cancelling the request")
-                        await self._llm_engine.abort(request.id)
-                        self.logger.log_info("[vllm] Successfully cancelled the request")
-                        break
+                num_outputs = 0
 
-                    # Create and buffer response
-                    if request_task_name == "generate":
-                        response = request.create_response(
-                            request_output=request_output,
-                            request_output_state={},
-                            prepend_input=request.prepend_input,
+                async def _collect_non_streaming_responses():
+                    nonlocal num_outputs
+                    async for request_output in response_iterator:
+                        # Cancellation check
+                        is_cancelled = response_sender.is_cancelled()
+                        if is_cancelled:
+                            self.logger.log_info("[vllm] Cancelling the request")
+                            await self._llm_engine.abort(request.id)
+                            self.logger.log_info(
+                                "[vllm] Successfully cancelled the request"
+                            )
+                            break
+
+                        # Create and buffer response
+                        if request_task_name == "generate":
+                            response = request.create_response(
+                                request_output=request_output,
+                                request_output_state={},
+                                prepend_input=request.prepend_input,
+                            )
+                        else:
+                            response = request.create_response(
+                                request_output=request_output,
+                            )
+                        responses_to_send.append(response)
+                        num_outputs += 1
+
+                embed_timeout = self._read_timeout_seconds(
+                    _EMBEDDING_TIMEOUT_ENV, _DEFAULT_EMBEDDING_TIMEOUT_SECONDS
+                )
+
+                try:
+                    if request_task_name == "embed" and embed_timeout > 0:
+                        await asyncio.wait_for(
+                            _collect_non_streaming_responses(), timeout=embed_timeout
                         )
                     else:
-                        response = request.create_response(
-                            request_output=request_output,
-                        )
-                    responses_to_send.append(response)
-                
+                        await _collect_non_streaming_responses()
+                except asyncio.TimeoutError as timeout_exc:
+                    self.logger.log_error(
+                        "[vllm] Embedding request timed out after %.1fs (request_id=%s, outputs=%d)"
+                        % (embed_timeout, request.id, num_outputs)
+                    )
+                    await self._llm_engine.abort(request.id)
+                    raise RuntimeError(
+                        f"Embedding request timed out after {embed_timeout:.1f}s with no complete backend response"
+                    ) from timeout_exc
+
+                # Defensive guard: never leave a non-streaming request without
+                # a final response. If the backend yields nothing, fail fast so
+                # the client receives an explicit error instead of hanging.
+                if len(responses_to_send) == 0:
+                    raise RuntimeError(
+                        "vLLM backend produced no outputs for non-streaming request"
+                    )
+
                 # Send all responses with proper flags
                 for idx, response in enumerate(responses_to_send):
-                    flags = pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL if idx == len(responses_to_send) - 1 else 0
+                    flags = (
+                        pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL
+                        if idx == len(responses_to_send) - 1
+                        else 0
+                    )
                     response_sender.send(response, flags=flags)
-                
+
                 # Manually decrement counter since we're not using response_queue
                 if len(responses_to_send) > 0:
                     self._ongoing_request_count -= 1

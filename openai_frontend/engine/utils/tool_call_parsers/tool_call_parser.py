@@ -95,7 +95,7 @@ class ToolParserManager:
             if not force and name in cls.tool_parsers:
                 existed_module = cls.tool_parsers[name]
                 raise KeyError(
-                    f"{name} is already registered " f"at {existed_module.__module__}"
+                    f"{name} is already registered at {existed_module.__module__}"
                 )
             cls.tool_parsers[name] = module
 
@@ -117,7 +117,7 @@ class ToolParserManager:
         # raise the error ahead of time
         if not (name is None or isinstance(name, str)):
             raise TypeError(
-                "name must be None, an instance of str, " f"but got {type(name)}"
+                f"name must be None, an instance of str, but got {type(name)}"
             )
 
         # use it as a normal method: x.register_module(module=SomeClass)

@@ -255,20 +255,24 @@ def _create_vllm_embedding_request(
 ):
     inputs = {}
     embedding_request = {}
-    
+
     # For image modality, create conversation in OpenAI format
     if request.modality == "image":
         # Prepare conversation for multimodal embedding
         instruction = "Represent the user's input."
-        
+
         # Convert input to list if it's a single string
         if isinstance(request.input, str):
             items = [request.input]
-        elif isinstance(request.input, list) and all(isinstance(x, str) for x in request.input):
+        elif isinstance(request.input, list) and all(
+            isinstance(x, str) for x in request.input
+        ):
             items = request.input
         else:
-            raise ClientError(f"For image modality, input must be a string or list of strings (URLs or base64), got: {type(request.input)}")
-        
+            raise ClientError(
+                f"For image modality, input must be a string or list of strings (URLs or base64), got: {type(request.input)}"
+            )
+
         # Create conversations (messages) for each item
         conversations = []
         for item in items:
@@ -276,19 +280,17 @@ def _create_vllm_embedding_request(
                 {"role": "system", "content": instruction},
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": item}}
-                    ]
-                }
+                    "content": [{"type": "image_url", "image_url": {"url": item}}],
+                },
             ]
             conversations.append(conversation)
-        
+
         # Pass conversations to backend - vLLM will handle everything
         embedding_request["input"] = conversations
     else:
         # Text modality - use input as-is
         embedding_request["input"] = request.input
-    
+
     embedding_request["modality"] = request.modality
 
     pooling_params = {}
@@ -744,7 +746,7 @@ def _parse_lora_configs(
                         lora_task_id += 1
         except ServerError as e:
             raise e
-        except Exception as e:
+        except Exception:
             # LoRA is enabled but its list is not provided or malformed?
             print(traceback.format_exc())
             return None

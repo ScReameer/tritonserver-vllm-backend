@@ -321,7 +321,12 @@ class GenerateRequest(RequestBase):
 
 class EmbedRequest(RequestBase):
     def __init__(
-        self, request, executor_callback: Callable, output_dtype: np.dtype, logger, tokenizer=None
+        self,
+        request,
+        executor_callback: Callable,
+        output_dtype: np.dtype,
+        logger,
+        tokenizer=None,
     ):
         super().__init__(request, executor_callback, output_dtype, logger)
         self.tokenizer = tokenizer
@@ -331,13 +336,13 @@ class EmbedRequest(RequestBase):
             self.triton_request, "embedding_request"
         ).as_numpy()[0]
         embedding_request = json.loads(embedding_request.decode("utf-8"))
-        
+
         # Get modality (default to "text")
         modality = embedding_request.get("modality", "text")
-        
+
         # prompt/input
         input_data = embedding_request["input"]
-        
+
         if modality == "image":
             # For image modality, return raw conversations for async processing in execute()
             conversations = input_data if isinstance(input_data, list) else [input_data]
@@ -387,17 +392,19 @@ class EmbedRequest(RequestBase):
         async def process_single_item(item):
             outputs = []
             unique_id = random_uuid()
-            async for response in self.executor_callback(item, pooling_params, unique_id):
+            async for response in self.executor_callback(
+                item, pooling_params, unique_id
+            ):
                 outputs.append(response)
             return outputs
 
         # Handle image modality - process conversations asynchronously
         if isinstance(prompt, dict) and prompt.get("modality") == "image":
             conversations = prompt["conversations"]
-            
+
             if not self.tokenizer:
                 raise ValueError("Tokenizer is required for multimodal embeddings")
-            
+
             # First pass: extract all data (prompt texts and image URLs).
             # We keep item-level errors instead of failing the whole batch.
             conversation_data = []
@@ -429,9 +436,7 @@ class EmbedRequest(RequestBase):
                                     isinstance(item, dict)
                                     and item.get("type") == "image_url"
                                 ):
-                                    image_url = (
-                                        item.get("image_url", {}).get("url")
-                                    )
+                                    image_url = item.get("image_url", {}).get("url")
                                     break
 
                 if not image_url:
@@ -548,16 +553,20 @@ class EmbedRequest(RequestBase):
                         "request_output": response,
                     }
             return
-        
+
         # Handle text batch - process each text separately
         elif isinstance(prompt, dict) and prompt.get("modality") == "text_batch":
             texts = prompt["texts"]
-            
+
             # Process all texts in parallel with asyncio.gather
             all_results = await asyncio.gather(*[process_single_item(t) for t in texts])
-            
+
             # Yield results in order
-            for result_list in all_results:
+            for idx, result_list in enumerate(all_results):
+                if len(result_list) == 0:
+                    raise ValueError(
+                        f"No embedding output produced for text item at index {idx}"
+                    )
                 for response in result_list:
                     yield response
             return
@@ -566,15 +575,23 @@ class EmbedRequest(RequestBase):
         response_iterator = self.executor_callback(prompt, pooling_params, self.id)
 
         # Yield each response from the async iterator
+        has_response = False
         async for response in response_iterator:
+            has_response = True
             yield response
+        if not has_response:
+            raise ValueError("No embedding output produced for input prompt")
 
     def _to_pooling_params(self, embedding_request: dict):
         pooling_params_dict = embedding_request.get("pooling_params", {})
-        
+
         # Extract dimensions if present
-        dims = pooling_params_dict.get("dimensions", [None])[0] if "dimensions" in pooling_params_dict else None
-        
+        dims = (
+            pooling_params_dict.get("dimensions", [None])[0]
+            if "dimensions" in pooling_params_dict
+            else None
+        )
+
         # Create PoolingParams once with all parameters
         if dims is not None:
             return PoolingParams(dimensions=dims, task="embed")

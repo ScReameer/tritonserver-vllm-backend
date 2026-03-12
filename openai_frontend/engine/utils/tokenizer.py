@@ -36,7 +36,7 @@ AnyTokenizer = Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
 
 
 def get_cached_tokenizer(
-    tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
+    tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Get tokenizer with cached properties.
 

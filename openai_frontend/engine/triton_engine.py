@@ -31,6 +31,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -99,8 +100,24 @@ from schemas.openai import (
 )
 from utils.utils import ClientError, ServerError
 
-
 logger = logging.getLogger(__name__)
+_EMBEDDING_TIMEOUT_ENV = "OPENAI_EMBEDDING_TIMEOUT_SECONDS"
+_DEFAULT_EMBEDDING_TIMEOUT_SECONDS = 90.0
+
+
+def _read_timeout_seconds(env_name: str, default_seconds: float) -> float:
+    raw_value = os.getenv(env_name, str(default_seconds))
+    try:
+        return float(raw_value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using %.1f seconds",
+            env_name,
+            raw_value,
+            default_seconds,
+        )
+        return default_seconds
+
 
 # TODO: Improve type hints
 @dataclass
@@ -419,13 +436,19 @@ class TritonLLMEngine(LLMEngine):
                 request,
             )
         )
-        
+
         # Process responses in parallel to avoid sequential bottleneck
         async def process_response(response, idx):
+            # Prefer surfacing backend-side errors directly.
+            if getattr(response, "error", None):
+                raise ServerError(f"Embedding backend error: {response.error}")
+
             # Extract embedding from response
             embedding_json = _get_output(response)
+            if not embedding_json:
+                raise ServerError("Received empty embedding payload from backend")
             parsed_output = json.loads(embedding_json)
-            
+
             usage = _get_usage_from_response(
                 response, metadata.backend, RequestKind.EMBEDDING
             )
@@ -461,9 +484,7 @@ class TritonLLMEngine(LLMEngine):
                         ),
                         usage,
                     )
-                raise ServerError(
-                    f"Unexpected embedding item object type: {item_type}"
-                )
+                raise ServerError(f"Unexpected embedding item object type: {item_type}")
 
             # Text modality and legacy image responses use plain embedding arrays.
             if not isinstance(parsed_output, list):
@@ -476,18 +497,40 @@ class TritonLLMEngine(LLMEngine):
                 EmbeddingObject(embedding=embedding, index=idx, object="embedding"),
                 usage,
             )
-        
+
         # Create tasks for all responses (non-blocking collection)
         tasks = []
         response_count = 0
-        async for response in responses:
-            task = asyncio.create_task(process_response(response, response_count))
-            tasks.append(task)
-            response_count += 1
-        
+        timeout_seconds = _read_timeout_seconds(
+            _EMBEDDING_TIMEOUT_ENV, _DEFAULT_EMBEDDING_TIMEOUT_SECONDS
+        )
+
+        async def _collect_response_tasks():
+            nonlocal response_count
+            async for response in responses:
+                task = asyncio.create_task(process_response(response, response_count))
+                tasks.append(task)
+                response_count += 1
+
+        try:
+            if timeout_seconds > 0:
+                await asyncio.wait_for(
+                    _collect_response_tasks(), timeout=timeout_seconds
+                )
+            else:
+                await _collect_response_tasks()
+        except asyncio.TimeoutError as e:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            raise ServerError(
+                "Timed out waiting for embedding responses from backend "
+                f"after {timeout_seconds:.1f}s"
+            ) from e
+
         # Wait for all processing tasks to complete in parallel
         results = await asyncio.gather(*tasks)
-        
+
         # Collect results
         data_items: List[EmbeddingObject | ErrorItem] = []
         total_usage = None
@@ -499,7 +542,7 @@ class TritonLLMEngine(LLMEngine):
                 else:
                     total_usage.prompt_tokens += usage.prompt_tokens
                     total_usage.total_tokens += usage.total_tokens
-        
+
         # Validate
         if len(data_items) < 1:
             raise ServerError(
@@ -594,13 +637,15 @@ class TritonLLMEngine(LLMEngine):
 
             echo_tensor_name = None
             is_multimodal = False
-            
+
             # Check for multimodal support in model config parameters
             config_params = model.config().get("parameters", {})
             if "multimodal" in config_params:
-                param_value = config_params["multimodal"].get("string_value", "").lower()
+                param_value = (
+                    config_params["multimodal"].get("string_value", "").lower()
+                )
                 is_multimodal = param_value in ["true", "1", "yes"]
-            
+
             # Check for echo tensor and image input support
             # For Python backend (vLLM), only use explicit multimodal parameter
             # because vLLM auto-creates 'image' input even for text-only models
@@ -1149,9 +1194,9 @@ class TritonLLMEngine(LLMEngine):
                 f"1. Use a multimodal embedding model (e.g., Qwen3-VL-Embedding)\n"
                 f"2. Explicitly enable multimodal support in the model's config.pbtxt:\n\n"
                 f"parameters: {{\n"
-                f"  key: \"multimodal\"\n"
+                f'  key: "multimodal"\n'
                 f"  value: {{\n"
-                f"    string_value: \"true\"\n"
+                f'    string_value: "true"\n'
                 f"  }}\n"
                 f"}}\n\n"
                 f"Alternatively, use modality='text' for text-only embeddings."
