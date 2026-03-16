@@ -1,10 +1,21 @@
-Local test:
+# Multimodal Embeddings on Runpod
 
+Small OpenAI-compatible embedding server for multimodal models on Triton + vLLM.
+
+**Local Run**
 ```bash
 docker compose up --build
 ```
 
-Text emdbeddings:
+The API is available at `http://localhost:9000/v1/embeddings`.
+
+**Notes**
+- `instruction` is optional.
+- If `instruction` is omitted, the request uses the default behavior.
+- If `instruction` is set, it is used as the custom system instruction for the vLLM conversation.
+- A non-empty `instruction` increases `usage.prompt_tokens`.
+
+**Text Embeddings**
 ```bash
 MODEL="Qwen3-VL-Embedding-8B"
 curl -s http://localhost:9000/v1/embeddings \
@@ -13,25 +24,30 @@ curl -s http://localhost:9000/v1/embeddings \
     "model": "'${MODEL}'",
     "input": ["The food was delicious and the waiter..."],
     "dimensions": 10,
-    "encoding_format": "float"
+    "encoding_format": "float",
+    "instruction": "Represent the text for semantic search."
   }' | jq
 ```
 
-Image emdbeddings:
+**Image Embeddings**
 ```bash
 MODEL="Qwen3-VL-Embedding-8B"
 curl -s http://localhost:9000/v1/embeddings \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "'${MODEL}'",
-    "input": ["https://raw.githubusercontent.com/pytorch/hub/master/images/dog.jpg", "https://example.com/123.jpg"],
+    "input": [
+      "https://raw.githubusercontent.com/pytorch/hub/master/images/dog.jpg",
+      "https://example.com/123.jpg"
+    ],
     "dimensions": 5,
     "encoding_format": "float",
-    "modality": "image"
+    "modality": "image",
+    "instruction": "Represent the image for retrieval."
   }' | jq
 ```
 
-Output:
+Example response:
 ```json
 {
   "object": "list",
@@ -61,7 +77,7 @@ Output:
 }
 ```
 
-Test after deploy:
+**Runpod Check**
 ```bash
 MODEL="Qwen3-VL-Embedding-8B"
 RUNPOD_API_KEY="YOUR_RUNPOD_API_KEY"
