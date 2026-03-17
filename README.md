@@ -78,7 +78,7 @@ Example response:
 }
 ```
 
-**Runpod example**
+**Runpod example (load balancer mode)**
 ```bash
 MODEL="Qwen3-VL-Embedding-8B"
 RUNPOD_API_KEY="YOUR_RUNPOD_API_KEY"
